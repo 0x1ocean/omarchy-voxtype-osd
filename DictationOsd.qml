@@ -4,6 +4,8 @@ import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
+import "components"
+import "lib/WaveformMath.js" as WaveformMath
 
 Item {
   id: root
@@ -20,6 +22,7 @@ Item {
   property real smoothedEnergy: 0.04
   property real noiseFloor: 0.04
 
+  readonly property real baseLevel: 0.04
   readonly property int barCount: 29
   readonly property int barWidth: Style.space(3)
   readonly property int barGap: Style.space(4)
@@ -31,10 +34,8 @@ Item {
   readonly property color waveColor: displayState === "recording" ? Color.bar.active : Color.accent
 
   function resetLevels() {
-    var next = []
-    for (var i = 0; i <= Math.floor(barCount / 2); i++) next.push(0.04)
-    levels = next
-    smoothedEnergy = 0.04
+    levels = WaveformMath.createHistory(barCount, baseLevel)
+    smoothedEnergy = baseLevel
     audioSample = 0
   }
 
@@ -87,87 +88,18 @@ Item {
     }
   }
 
-  function updateStatus(raw) {
-    try {
-      var data = JSON.parse(String(raw || "{}").trim())
-      showState(String(data.alt || data.class || "idle"))
-    } catch (error) {
-      console.warn("Voxtype OSD: invalid status payload", error)
-    }
-  }
-
-  function updateAudio(raw) {
+  function updateAudio(peak, rms) {
     if (daemonState !== "recording") return
 
-    try {
-      var data = JSON.parse(String(raw || "{}").trim())
-      if (typeof data.peak !== "number" || typeof data.rms !== "number") return
+    // The bridge emits about 100 frames per second. Sampling every third
+    // frame gives the waveform a calmer, Superwhisper-like motion.
+    audioSample++
+    if (audioSample % 3 !== 0) return
 
-      // The bridge emits about 100 frames per second. Sampling every third
-      // frame gives the waveform a calmer, Superwhisper-like motion.
-      audioSample++
-      if (audioSample % 3 !== 0) return
-
-      var raw = Math.min(1, Math.max(0, data.rms * 0.72 + data.peak * 0.28))
-
-      // Voxtype 1.0 currently reports VAD=true even for quiet input, so learn
-      // the floor directly from RMS/peak. It falls quickly when the room gets
-      // quieter and rises very slowly, which prevents speech from becoming
-      // the new baseline.
-      var floorSpeed = raw < noiseFloor ? 0.12 : 0.006
-      noiseFloor += (raw - noiseFloor) * floorSpeed
-
-      var threshold = Math.min(0.30, noiseFloor * 1.65 + 0.008)
-      var gated = Math.max(0, (raw - threshold) / Math.max(0.15, 0.55 - threshold))
-      var compressed = Math.pow(Math.min(1, gated), 0.65)
-      var target = 0.04 + compressed * 0.96
-
-      // Fast attack makes the OSD feel immediate; the slower release keeps
-      // the bars fluid instead of nervous between syllables.
-      var smoothing = target > smoothedEnergy ? 0.55 : 0.21
-      smoothedEnergy += (target - smoothedEnergy) * smoothing
-
-      // The newest sample starts in the centre and its history travels
-      // symmetrically towards both edges.
-      var next = [smoothedEnergy]
-      for (var i = 0; i < levels.length - 1; i++) next.push(levels[i])
-      levels = next
-    } catch (error) {
-      // Status messages from the bridge intentionally contain no audio data.
-    }
-  }
-
-  function recordingLevel(index) {
-    var center = Math.floor(barCount / 2)
-    var distance = Math.abs(index - center)
-    if (distance < 0 || distance >= levels.length) return 0.04
-    var level = Math.max(0.04, Math.min(1, Number(levels[distance]) || 0))
-    var age = distance / Math.max(1, levels.length - 1)
-    return 0.04 + (level - 0.04) * (1 - age * 0.38)
-  }
-
-  function processingLevel(index) {
-    // One soft pulse crosses the surface, fully leaving the edge before the
-    // next pass begins so the loop has no visible jump.
-    var position = -4 + phase * (barCount + 8)
-    var distance = index - position
-    var pulse = Math.exp(-(distance * distance) / 9)
-    return Math.min(1, 0.10 + pulse * 0.84)
-  }
-
-  function levelAt(index) {
-    var recorded = recordingLevel(index)
-    var processing = processingLevel(index)
-    var level = recorded * (1 - processingMix) + processing * processingMix
-
-    if (displayState === "finishing")
-      level = level * (1 - finishProgress) + 0.04 * finishProgress
-
-    return level
-  }
-
-  function heightAt(index) {
-    return minBarHeight + (maxBarHeight - minBarHeight) * levelAt(index)
+    var frame = WaveformMath.frameEnergy(rms, peak, noiseFloor, baseLevel)
+    noiseFloor = frame.noiseFloor
+    smoothedEnergy = WaveformMath.smoothEnergy(smoothedEnergy, frame.target)
+    levels = WaveformMath.pushHistory(levels, smoothedEnergy)
   }
 
   Component.onCompleted: resetLevels()
@@ -208,20 +140,9 @@ Item {
     NumberAnimation { duration: 120; easing.type: Easing.OutCubic }
   }
 
-  Process {
-    command: ["bash", "-c", "exec omarchy-voxtype-status"]
-    running: true
-    stdout: SplitParser {
-      onRead: function(data) { root.updateStatus(data) }
-    }
-  }
-
-  Process {
-    command: ["/usr/bin/voxtype-audio-bridge"]
-    running: true
-    stdout: SplitParser {
-      onRead: function(data) { root.updateAudio(data) }
-    }
+  VoxtypeBridge {
+    onStateReceived: function(state) { root.showState(state) }
+    onAudioFrame: function(peak, rms) { root.updateAudio(peak, rms) }
   }
 
   Timer {
@@ -280,34 +201,22 @@ Item {
       opacity: root.reveal * (1 - root.finishProgress)
       scale: 0.97 + root.reveal * 0.03 - root.finishProgress * 0.015
 
-      Row {
+      Waveform {
         anchors.centerIn: parent
-        spacing: root.barGap
-
-        Repeater {
-          model: root.barCount
-
-          Rectangle {
-            required property int index
-
-            width: root.barWidth
-            height: root.heightAt(index)
-            anchors.verticalCenter: parent.verticalCenter
-            radius: Style.cornerRadius > 0 ? width / 2 : 0
-            color: root.waveColor
-
-            Behavior on height {
-              NumberAnimation {
-                duration: root.displayState === "recording" ? 45 : 75
-                easing.type: Easing.OutCubic
-              }
-            }
-
-            Behavior on color {
-              ColorAnimation { duration: 160 }
-            }
-          }
-        }
+        width: implicitWidth
+        height: implicitHeight
+        barCount: root.barCount
+        barWidth: root.barWidth
+        barGap: root.barGap
+        minBarHeight: root.minBarHeight
+        maxBarHeight: root.maxBarHeight
+        baseLevel: root.baseLevel
+        phase: root.phase
+        processingMix: root.processingMix
+        finishProgress: root.finishProgress
+        levels: root.levels
+        displayState: root.displayState
+        waveColor: root.waveColor
       }
     }
   }
