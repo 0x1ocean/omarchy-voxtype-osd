@@ -13,8 +13,12 @@ Item {
   property bool panelMapped: false
   property real reveal: 0
   property real phase: 0
+  property real processingMix: 0
+  property real finishProgress: 0
   property var levels: []
   property int audioSample: 0
+  property real smoothedEnergy: 0.04
+  property real noiseFloor: 0.04
 
   readonly property int barCount: 29
   readonly property int barWidth: Style.space(3)
@@ -28,28 +32,58 @@ Item {
 
   function resetLevels() {
     var next = []
-    for (var i = 0; i < barCount; i++) next.push(0.06)
+    for (var i = 0; i <= Math.floor(barCount / 2); i++) next.push(0.04)
     levels = next
+    smoothedEnergy = 0.04
+    audioSample = 0
+  }
+
+  function finishSurface() {
+    panelMapped = false
+    displayState = "idle"
+    reveal = 0
+    finishProgress = 0
+    processingMix = 0
+    resetLevels()
   }
 
   function showState(next) {
     if (next !== "recording" && next !== "transcribing") next = "idle"
 
-    var wasActive = root.active
+    var previous = daemonState
     daemonState = next
 
     if (next === "recording" || next === "transcribing") {
-      hideTimer.stop()
-      if (next === "recording" && displayState !== "recording") resetLevels()
+      enterAnimation.stop()
+      cancelAnimation.stop()
+      finishAnimation.stop()
+      finishProgress = 0
+
+      if (next === "recording" && previous !== "recording") resetLevels()
+      if (next === "transcribing" && previous !== "transcribing") phase = 0
+
       displayState = next
-      panelMapped = true
-      reveal = 1
+      processingMix = next === "transcribing" ? 1 : 0
+
+      if (!panelMapped) {
+        reveal = 0
+        panelMapped = true
+        enterAnimation.restart()
+      } else {
+        reveal = 1
+      }
       return
     }
 
-    if (wasActive || panelMapped) {
-      reveal = 0
-      hideTimer.restart()
+    if (previous === "transcribing" && panelMapped) {
+      displayState = "finishing"
+      reveal = 1
+      finishProgress = 0
+      finishAnimation.restart()
+    } else if (panelMapped) {
+      cancelAnimation.restart()
+    } else {
+      finishSurface()
     }
   }
 
@@ -74,26 +108,62 @@ Item {
       audioSample++
       if (audioSample % 3 !== 0) return
 
-      var energy = Math.min(1, Math.max(0.06, data.rms * 6 + data.peak * 0.85))
-      var next = levels.slice(1)
-      next.push(energy)
+      var raw = Math.min(1, Math.max(0, data.rms * 0.72 + data.peak * 0.28))
+
+      // Voxtype 1.0 currently reports VAD=true even for quiet input, so learn
+      // the floor directly from RMS/peak. It falls quickly when the room gets
+      // quieter and rises very slowly, which prevents speech from becoming
+      // the new baseline.
+      var floorSpeed = raw < noiseFloor ? 0.12 : 0.006
+      noiseFloor += (raw - noiseFloor) * floorSpeed
+
+      var threshold = Math.min(0.30, noiseFloor * 1.65 + 0.008)
+      var gated = Math.max(0, (raw - threshold) / Math.max(0.15, 0.55 - threshold))
+      var compressed = Math.pow(Math.min(1, gated), 0.65)
+      var target = 0.04 + compressed * 0.96
+
+      // Fast attack makes the OSD feel immediate; the slower release keeps
+      // the bars fluid instead of nervous between syllables.
+      var smoothing = target > smoothedEnergy ? 0.55 : 0.21
+      smoothedEnergy += (target - smoothedEnergy) * smoothing
+
+      // The newest sample starts in the centre and its history travels
+      // symmetrically towards both edges.
+      var next = [smoothedEnergy]
+      for (var i = 0; i < levels.length - 1; i++) next.push(levels[i])
       levels = next
     } catch (error) {
       // Status messages from the bridge intentionally contain no audio data.
     }
   }
 
-  function levelAt(index) {
-    if (displayState === "transcribing") {
-      var center = (barCount - 1) / 2
-      var distance = Math.abs(index - center) / Math.max(1, center)
-      var envelope = 0.30 + 0.70 * (1 - Math.pow(distance, 1.7))
-      var travellingWave = 0.5 + 0.5 * Math.sin(phase - index * 0.52)
-      return 0.12 + envelope * travellingWave * 0.78
-    }
+  function recordingLevel(index) {
+    var center = Math.floor(barCount / 2)
+    var distance = Math.abs(index - center)
+    if (distance < 0 || distance >= levels.length) return 0.04
+    var level = Math.max(0.04, Math.min(1, Number(levels[distance]) || 0))
+    var age = distance / Math.max(1, levels.length - 1)
+    return 0.04 + (level - 0.04) * (1 - age * 0.38)
+  }
 
-    if (index < 0 || index >= levels.length) return 0.06
-    return Math.max(0.06, Math.min(1, Number(levels[index]) || 0))
+  function processingLevel(index) {
+    // One soft pulse crosses the surface, fully leaving the edge before the
+    // next pass begins so the loop has no visible jump.
+    var position = -4 + phase * (barCount + 8)
+    var distance = index - position
+    var pulse = Math.exp(-(distance * distance) / 9)
+    return Math.min(1, 0.10 + pulse * 0.84)
+  }
+
+  function levelAt(index) {
+    var recorded = recordingLevel(index)
+    var processing = processingLevel(index)
+    var level = recorded * (1 - processingMix) + processing * processingMix
+
+    if (displayState === "finishing")
+      level = level * (1 - finishProgress) + 0.04 * finishProgress
+
+    return level
   }
 
   function heightAt(index) {
@@ -101,6 +171,42 @@ Item {
   }
 
   Component.onCompleted: resetLevels()
+
+  NumberAnimation {
+    id: enterAnimation
+    target: root
+    property: "reveal"
+    from: 0
+    to: 1
+    duration: 95
+    easing.type: Easing.OutCubic
+  }
+
+  NumberAnimation {
+    id: cancelAnimation
+    target: root
+    property: "reveal"
+    from: root.reveal
+    to: 0
+    duration: 150
+    easing.type: Easing.OutCubic
+    onFinished: root.finishSurface()
+  }
+
+  NumberAnimation {
+    id: finishAnimation
+    target: root
+    property: "finishProgress"
+    from: 0
+    to: 1
+    duration: 160
+    easing.type: Easing.InOutCubic
+    onFinished: root.finishSurface()
+  }
+
+  Behavior on processingMix {
+    NumberAnimation { duration: 120; easing.type: Easing.OutCubic }
+  }
 
   Process {
     command: ["bash", "-c", "exec omarchy-voxtype-status"]
@@ -119,20 +225,10 @@ Item {
   }
 
   Timer {
-    interval: 40
-    running: root.panelMapped
+    interval: 16
+    running: root.panelMapped && (root.displayState === "transcribing" || root.displayState === "finishing")
     repeat: true
-    onTriggered: root.phase = (root.phase + 0.19) % (Math.PI * 2)
-  }
-
-  Timer {
-    id: hideTimer
-    interval: 180
-    onTriggered: {
-      root.panelMapped = false
-      root.displayState = "idle"
-      root.resetLevels()
-    }
+    onTriggered: root.phase = (root.phase + 0.0145) % 1
   }
 
   // Handy for development and screenshots:
@@ -178,19 +274,11 @@ Item {
       anchors.horizontalCenter: parent.horizontalCenter
       anchors.bottom: parent.bottom
       anchors.bottomMargin: Style.space(67)
-      color: Util.alpha(Color.popups.background, 0.97)
+      color: Color.popups.background
       borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Math.max(1, Style.space(2)))
       radius: Style.cornerRadius
-      opacity: root.reveal
-      scale: 0.98 + root.reveal * 0.02
-
-      Behavior on opacity {
-        NumberAnimation { duration: 140; easing.type: Easing.OutCubic }
-      }
-
-      Behavior on scale {
-        NumberAnimation { duration: 140; easing.type: Easing.OutCubic }
-      }
+      opacity: root.reveal * (1 - root.finishProgress)
+      scale: 0.97 + root.reveal * 0.03 - root.finishProgress * 0.015
 
       Row {
         anchors.centerIn: parent
@@ -210,7 +298,7 @@ Item {
 
             Behavior on height {
               NumberAnimation {
-                duration: root.displayState === "recording" ? 70 : 110
+                duration: root.displayState === "recording" ? 45 : 75
                 easing.type: Easing.OutCubic
               }
             }

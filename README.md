@@ -9,10 +9,11 @@ corner radius all come from Omarchy's shared design tokens.
 
 ## Experience
 
-- A live waveform appears while recording.
-- The waveform changes color and becomes an indeterminate animation while
-  Voxtype is transcribing.
-- It fades away when the result is ready.
+- A noise-gated live waveform grows from the centre while recording.
+- Fast attack and soft release keep it responsive without looking nervous.
+- The last audio shape morphs into a travelling accent pulse while Voxtype
+  is transcribing.
+- The waveform settles into a line and fades when the result is ready.
 - No labels, transcript previews, notifications, or input-blocking surfaces.
 
 ## Requirements
