@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.0x1ocean.voxtype-osd",
+  "name": "Voxtype OSD",
+  "version": "0.1.0",
+  "author": "0x1ocean",
+  "description": "A theme-aware, text-free dictation waveform for Omarchy and Voxtype.",
+  "kinds": [
+    "panel"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "panel": "DictationOsd.qml"
+  }
+}
