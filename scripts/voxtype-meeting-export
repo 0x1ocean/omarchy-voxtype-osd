@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Export completed Voxtype meetings once, without replacing edited notes."""
+
+import argparse
+from contextlib import closing
+from datetime import datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import tomllib
+from uuid import UUID
+
+
+def default_database():
+    config_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    config_path = config_dir / "voxtype/config.toml"
+    config = tomllib.loads(config_path.read_text()) if config_path.exists() else {}
+    storage = config.get("meeting", {}).get("storage_path", "auto")
+    if storage != "auto":
+        return Path(storage).expanduser() / "index.db"
+    data_dir = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+    return data_dir / "voxtype/meetings/index.db"
+
+
+def write_atomic(path, content, replace):
+    """Publish only complete files, and never clobber an existing user note."""
+    fd, temporary = tempfile.mkstemp(prefix=".voxtype-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        if replace:
+            os.replace(temporary, path)
+        else:
+            os.link(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def export_completed(database, notes_dir, state_file):
+    if not database.exists():
+        return 0
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    with state_file.with_suffix(".lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0  # Another exporter already owns this batch.
+        ledger = json.loads(state_file.read_text()) if state_file.exists() else {}
+        notes_dir = notes_dir.expanduser().resolve()
+        if not isinstance(ledger, dict) or not isinstance(ledger.get(str(notes_dir), {}), dict):
+            raise ValueError("Invalid export ledger; preserve it for recovery")
+        exported = ledger.setdefault(str(notes_dir), {})
+        with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)) as db:
+            rows = db.execute("SELECT id, started_at, storage_path, chunk_count FROM meetings WHERE status = 'completed' ORDER BY started_at").fetchall()
+        failed = False
+        for meeting_id, started_at, storage_path, chunk_count in rows:
+            if meeting_id in exported:
+                continue
+            try:
+                meeting_id = str(UUID(meeting_id))
+                transcript_path = Path(storage_path) / "transcript.json"
+                snapshot = transcript_path.stat()
+                transcript = json.loads(transcript_path.read_text())
+                if not isinstance(transcript, dict) or transcript.get("total_chunks") != chunk_count:
+                    raise ValueError("Final transcript is not ready yet")
+                date = datetime.fromtimestamp(started_at).astimezone()
+                filename = f"{date:%Y-%m-%d %H-%M-%S} {meeting_id[:8]}.md"
+                notes_dir.mkdir(parents=True, exist_ok=True)
+                target = notes_dir / filename
+                marker = f"<!-- voxtype-meeting: {meeting_id} -->"
+                # Recover a successful write interrupted before the receipt was saved.
+                if target.exists() and not target.read_text().startswith(marker):
+                    target = notes_dir / f"{date:%Y-%m-%d %H-%M-%S} {meeting_id}.md"
+                if not target.exists():
+                    result = subprocess.run(
+                        ["voxtype", "meeting", "export", meeting_id, "--format", "markdown",
+                         "--speakers", "--timestamps", "--metadata"],
+                        capture_output=True, text=True, encoding="utf-8", timeout=60, check=True,
+                    )
+                    if not result.stdout.strip():
+                        raise ValueError("Voxtype returned an empty export")
+                    latest = transcript_path.stat()
+                    if (snapshot.st_mtime_ns, snapshot.st_size) != (latest.st_mtime_ns, latest.st_size):
+                        raise ValueError("Transcript changed during export; retry later")
+                    write_atomic(target, marker + "\n\n" + result.stdout.rstrip() + "\n", replace=False)
+                    print(f"Saved meeting note: {target}", flush=True)
+                elif not target.read_text().startswith(marker):
+                    raise FileExistsError(f"Refusing to replace existing note: {target}")
+                exported[meeting_id] = str(target)
+                write_atomic(state_file, json.dumps(ledger, indent=2) + "\n", replace=True)
+            except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
+                # Log IDs and failure type, never transcript contents or CLI stderr.
+                print(f"Meeting export failed for {meeting_id}: {type(error).__name__}", file=sys.stderr)
+                failed = True
+        return 1 if failed else 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--notes-dir", type=Path, default=Path.home() / "notes/meetings")
+    parser.add_argument("--database", type=Path)
+    state_dir = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+    parser.add_argument("--state-file", type=Path, default=state_dir / "voxtype/meeting-note-exports.json")
+    args = parser.parse_args()
+    return export_completed(args.database or default_database(), args.notes_dir, args.state_file)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

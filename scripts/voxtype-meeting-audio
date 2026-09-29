@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# Record a call mix and source tracks; publish verified recorder progress to VoxWave.
+set -u
+umask 077
+
+runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/voxtype"
+state_file="$runtime_dir/meeting_state"
+health_dir="$runtime_dir/meeting-audio"
+audio_dir="${XDG_DATA_HOME:-$HOME/.local/share}/voxtype/meeting-audio"
+mkdir -p "$health_dir" || exit 1
+exec 9>"$health_dir/recorder.lock"
+flock -n 9 || exit 0
+
+progress_file="$health_dir/progress"
+recorder_pid=""
+active_id=""
+part=0
+stop_requested=false
+session_active=false
+had_error=false
+had_audio=false
+part_confirmed=false
+progress_us=0
+last_progress_at=0
+retry_at=0
+
+# Carry incomplete/error outcomes through a service restart. Restarting while
+# recording can leave a gap even if the replacement process starts promptly.
+previous_status=""
+previous_id=""
+if [[ -f "$health_dir/status.json" ]]; then
+  IFS= read -r previous_status < "$health_dir/status.json" || true
+  if [[ "$previous_status" =~ \"id\":\"([0-9a-f-]{36})\" ]]; then
+    previous_id="${BASH_REMATCH[1]}"
+  fi
+fi
+startup_state=""
+startup_id=""
+if [[ -f "$state_file" ]]; then
+  { IFS= read -r startup_state || :; IFS= read -r startup_id || :; } < "$state_file"
+fi
+
+publish() {
+  local timestamp=$(( ${EPOCHREALTIME/./} / 1000 ))
+  printf '{"id":"%s","state":"%s","updatedAtMs":%s,"hadError":%s,"hasAudio":%s}\n' \
+    "$active_id" "$1" "$timestamp" "$had_error" "$had_audio" > "$health_dir/status.tmp"
+  mv -f "$health_dir/status.tmp" "$health_dir/status.json"
+}
+
+read_progress() {
+  local latest
+  latest="$(tail -n 24 "$progress_file" 2>/dev/null | awk -F= '$1 == "out_time_us" {value=$2} END {print value}')"
+  if [[ "$latest" =~ ^[0-9]+$ ]] && (( latest > progress_us )); then
+    progress_us=$latest
+    last_progress_at=$EPOCHSECONDS
+    part_confirmed=true
+    had_audio=true
+  fi
+}
+
+stop_recorder() {
+  if [[ -n "$recorder_pid" ]]; then
+    local result=0 attempt
+    kill -TERM "$recorder_pid" 2>/dev/null || true
+    # Audio backends can hang during shutdown. Bound the wait so pause/stop
+    # and the service itself remain responsive; a forced close is never Done.
+    for ((attempt = 0; attempt < 30; attempt++)); do
+      kill -0 "$recorder_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$recorder_pid" 2>/dev/null; then
+      had_error=true
+      kill -KILL "$recorder_pid" 2>/dev/null || true
+    fi
+    wait "$recorder_pid" 2>/dev/null || result=$?
+    read_progress
+    if (( result != 0 && result != 255 )); then had_error=true; fi
+    if [[ "$part_confirmed" != true ]]; then had_error=true; fi
+    recorder_pid=""
+  fi
+}
+
+start_recorder() {
+  local microphone monitor output
+  microphone="$(timeout 2 pactl get-default-source)" || return 1
+  monitor="$(timeout 2 pactl get-default-sink).monitor" || return 1
+  mkdir -p "$audio_dir" || return 1
+  part=$((part + 1))
+  printf -v output '%s/%s-part%02d-%s.mka' \
+    "$audio_dir" "$active_id" "$part" "$(date -u +%Y%m%dT%H%M%S%N)"
+  : > "$progress_file"
+  progress_us=0
+  part_confirmed=false
+  last_progress_at=$EPOCHSECONDS
+
+  ffmpeg -nostdin -hide_banner -loglevel error -n \
+    -stats_period 0.5 -progress "$progress_file" \
+    -thread_queue_size 1024 -f pulse -i "$microphone" \
+    -thread_queue_size 1024 -f pulse -i "$monitor" \
+    -filter_complex '[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0[mix]' \
+    -map '[mix]' -map 0:a -map 1:a -c:a flac \
+    -metadata:s:a:0 title=Call -metadata:s:a:1 title=Microphone \
+    -metadata:s:a:2 title=System "$output" 9>&- &
+  recorder_pid=$!
+  printf 'Recording meeting %s to %s\n' "$active_id" "$output"
+}
+
+check_recorder() {
+  if [[ -n "$recorder_pid" ]] && ! kill -0 "$recorder_pid" 2>/dev/null; then
+    wait "$recorder_pid" 2>/dev/null || true
+    recorder_pid=""
+    had_error=true
+    retry_at=$((EPOCHSECONDS + 2))
+  fi
+  if [[ -z "$recorder_pid" ]]; then
+    if (( EPOCHSECONDS < retry_at )); then publish error; return; fi
+    if ! start_recorder; then
+      had_error=true
+      retry_at=$((EPOCHSECONDS + 2))
+      publish error
+      return
+    fi
+  fi
+  read_progress
+  if (( EPOCHSECONDS - last_progress_at >= 8 )); then
+    had_error=true
+    publish error
+    stop_recorder
+    retry_at=$((EPOCHSECONDS + 2))
+  elif [[ "$part_confirmed" == true ]]; then
+    publish recording
+  else
+    publish starting
+  fi
+}
+
+# Watch stop requests because the daemon consumes this file before it finishes
+# transcribing the last chunk. Health/progress writes live in a subdirectory.
+coproc WATCH { exec inotifywait -q -m -e create --format '%f' "$runtime_dir" 9>&-; }
+watch_fd="${WATCH[0]}"
+watch_pid="$WATCH_PID"
+
+cleanup() {
+  stop_recorder
+  if [[ "$session_active" == true ]]; then had_error=true; publish error; fi
+  kill "$watch_pid" 2>/dev/null || true
+  rm -f "$progress_file"
+}
+trap 'exit 0' TERM INT
+trap cleanup EXIT
+publish idle
+
+while :; do
+  event=""
+  if IFS= read -r -t 0.5 event <&"$watch_fd"; then
+    if [[ "$event" == "meeting_stop" && "$session_active" == true ]]; then
+      stop_requested=true
+      stop_recorder
+    fi
+  elif ! kill -0 "$watch_pid" 2>/dev/null; then
+    # systemd restarts us if the watcher fails; never silently miss stop events.
+    exit 1
+  fi
+
+  state="idle"
+  meeting_id=""
+  if [[ -f "$state_file" ]]; then
+    { IFS= read -r state || :; IFS= read -r meeting_id || :; } < "$state_file"
+    # Ignore the daemon's transient truncate/write gap.
+    [[ -z "$state" ]] && continue
+  fi
+
+  if [[ "$state" == "recording" || "$state" == "paused" ]]; then
+    [[ "$meeting_id" =~ ^[0-9a-f-]{36}$ ]] || continue
+    if [[ "$meeting_id" != "$active_id" ]]; then
+      stop_recorder
+      active_id="$meeting_id"
+      part=0
+      retry_at=0
+      stop_requested=false
+      had_error=false
+      had_audio=false
+      if [[ "$active_id" == "$previous_id" ]]; then
+        [[ "$previous_status" == *'"hadError":true'* ]] && had_error=true
+        [[ "$previous_status" == *'"hasAudio":true'* ]] && had_audio=true
+      fi
+      if [[ "$startup_state" == "recording" && "$active_id" == "$startup_id" ]]; then
+        had_error=true
+      fi
+    fi
+    session_active=true
+    # The hotkey marker survives the daemon consuming meeting_stop, including
+    # across a recorder-service restart during the final transcription.
+    if [[ -f "$runtime_dir/meeting-hotkey-stopping" ]] && \
+        [[ "$(cat "$runtime_dir/meeting-hotkey-stopping")" == "$active_id" ]]; then
+      stop_requested=true
+    fi
+    if [[ "$stop_requested" == true ]]; then
+      stop_recorder
+      publish finishing
+    elif [[ "$state" == "paused" ]]; then
+      stop_recorder
+      publish paused
+    else
+      check_recorder
+    fi
+  elif [[ "$state" == "idle" && "$session_active" == true ]]; then
+    stop_recorder
+    session_active=false
+    if [[ "$had_audio" != true ]]; then had_error=true; fi
+    if [[ "$had_error" == true ]]; then publish error; else publish done; fi
+  fi
+done

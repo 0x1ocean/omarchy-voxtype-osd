@@ -1,182 +1,51 @@
 import QtQuick
 import Quickshell
-import Quickshell.Io
 import Quickshell.Wayland
-import qs.Commons
-import qs.Ui
 import "components"
-import "lib/WaveformMath.js" as WaveformMath
 
 Item {
   id: root
 
-  property string daemonState: "idle"
-  property string displayState: "idle"
-  property bool panelMapped: false
-  property real reveal: 0
-  property real phase: 0
-  property real processingMix: 0
-  property real finishProgress: 0
-  property var levels: []
-  property int audioSample: 0
-  property real smoothedEnergy: 0.04
-  property real noiseFloor: 0.04
+  readonly property bool meetingVisible: meeting.active || meetingPresentation.presented
+  readonly property string runtimeDir: (Quickshell.env("XDG_RUNTIME_DIR")
+    || "/run/user/" + Quickshell.env("UID")) + "/voxtype"
 
-  readonly property real baseLevel: 0.04
-  readonly property int barCount: 29
-  readonly property int barWidth: Style.space(3)
-  readonly property int barGap: Style.space(4)
-  readonly property int cardWidth: Style.space(270)
-  readonly property int cardHeight: Style.space(48)
-  readonly property int minBarHeight: Style.space(3)
-  readonly property int maxBarHeight: Style.space(26)
-  readonly property bool active: daemonState === "recording" || daemonState === "transcribing"
-  readonly property color waveColor: displayState === "recording" ? Color.bar.active : Color.accent
-
-  function resetLevels() {
-    levels = WaveformMath.createHistory(barCount, baseLevel)
-    smoothedEnergy = baseLevel
-    audioSample = 0
+  DictationSession { id: dictation }
+  MeetingSession { id: meeting; runtimeDir: root.runtimeDir }
+  MeetingRecorder {
+    id: recorder
+    runtimeDir: root.runtimeDir
+    meetingId: meeting.id || meetingPresentation.lastMeetingId
+    monitoring: meeting.active || meetingPresentation.presented
+  }
+  DictationPreview {
+    id: preview
+    dictation: dictation
+    onMeetingPreviewCleared: meetingPresentation.reset()
   }
 
-  function finishSurface() {
-    panelMapped = false
-    displayState = "idle"
-    reveal = 0
-    finishProgress = 0
-    processingMix = 0
-    resetLevels()
-  }
-
-  function showState(next) {
-    if (next !== "recording" && next !== "transcribing") next = "idle"
-
-    var previous = daemonState
-    daemonState = next
-
-    if (next === "recording" || next === "transcribing") {
-      enterAnimation.stop()
-      cancelAnimation.stop()
-      finishAnimation.stop()
-      finishProgress = 0
-
-      if (next === "recording" && previous !== "recording") resetLevels()
-      if (next === "transcribing" && previous !== "transcribing") phase = 0
-
-      displayState = next
-      processingMix = next === "transcribing" ? 1 : 0
-
-      if (!panelMapped) {
-        reveal = 0
-        panelMapped = true
-        enterAnimation.restart()
-      } else {
-        reveal = 1
-      }
-      return
-    }
-
-    if (previous === "transcribing" && panelMapped) {
-      displayState = "finishing"
-      reveal = 1
-      finishProgress = 0
-      finishAnimation.restart()
-    } else if (panelMapped) {
-      cancelAnimation.restart()
-    } else {
-      finishSurface()
-    }
-  }
-
-  function updateAudio(peak, rms) {
-    if (daemonState !== "recording") return
-
-    // The bridge emits about 100 frames per second. Sampling every third
-    // frame gives the waveform a calmer, Superwhisper-like motion.
-    audioSample++
-    if (audioSample % 3 !== 0) return
-
-    var frame = WaveformMath.frameEnergy(rms, peak, noiseFloor, baseLevel)
-    noiseFloor = frame.noiseFloor
-    smoothedEnergy = WaveformMath.smoothEnergy(smoothedEnergy, frame.target)
-    levels = WaveformMath.pushHistory(levels, smoothedEnergy)
-  }
-
-  Component.onCompleted: resetLevels()
-
-  NumberAnimation {
-    id: enterAnimation
-    target: root
-    property: "reveal"
-    from: 0
-    to: 1
-    duration: 95
-    easing.type: Easing.OutCubic
-  }
-
-  NumberAnimation {
-    id: cancelAnimation
-    target: root
-    property: "reveal"
-    from: root.reveal
-    to: 0
-    duration: 150
-    easing.type: Easing.OutCubic
-    onFinished: root.finishSurface()
-  }
-
-  NumberAnimation {
-    id: finishAnimation
-    target: root
-    property: "finishProgress"
-    from: 0
-    to: 1
-    duration: 160
-    easing.type: Easing.InOutCubic
-    onFinished: root.finishSurface()
-  }
-
-  Behavior on processingMix {
-    NumberAnimation { duration: 120; easing.type: Easing.OutCubic }
+  MeetingPresentation {
+    id: meetingPresentation
+    meetingState: preview.meetingState || meeting.state
+    meetingId: preview.meetingState ? preview.meetingId : meeting.id
+    recorderHealth: preview.meetingState ? preview.meetingHealth : recorder.health
+    recorderHadError: preview.meetingState ? preview.meetingHealth === "error" : recorder.hadError
+    stopping: preview.meetingState ? preview.meetingStopping : meeting.stopping
+    elapsedText: preview.meetingState ? "01:23" : meeting.elapsedText
   }
 
   VoxtypeBridge {
-    onStateReceived: function(state) { root.showState(state) }
-    onAudioFrame: function(peak, rms) { root.updateAudio(peak, rms) }
-  }
-
-  Timer {
-    interval: 16
-    running: root.panelMapped && (root.displayState === "transcribing" || root.displayState === "finishing")
-    repeat: true
-    onTriggered: root.phase = (root.phase + 0.0145) % 1
-  }
-
-  // Handy for development and screenshots:
-  //   omarchy-shell voxtype-osd preview recording
-  //   omarchy-shell voxtype-osd preview transcribing
-  //   omarchy-shell voxtype-osd hide
-  IpcHandler {
-    target: "voxtype-osd"
-
-    function preview(state: string): string {
-      root.showState(state)
-      return "ok"
-    }
-
-    function hide(): string {
-      root.showState("idle")
-      return "ok"
-    }
-
-    function state(): string {
-      return root.daemonState
+    runtimeDir: root.runtimeDir
+    onStateReceived: function(state) { preview.receiveLiveState(state) }
+    onMeetingStateReceived: function(state, id) { meeting.receiveState(state, id) }
+    onMeetingStoppingReceived: function(id) { meeting.stoppingId = id }
+    onAudioFrame: function(peak, rms) {
+      if (!preview.dictationOverride) dictation.updateAudio(peak, rms)
     }
   }
 
   PanelWindow {
-    id: panel
-    visible: root.panelMapped
+    visible: dictation.panelMapped || root.meetingVisible
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
 
@@ -188,36 +57,13 @@ Item {
     // The overlay is visual only and never steals clicks from applications.
     mask: Region {}
 
-    BorderSurface {
-      id: card
-      width: root.cardWidth
-      height: root.cardHeight
-      anchors.horizontalCenter: parent.horizontalCenter
-      anchors.bottom: parent.bottom
-      anchors.bottomMargin: Style.space(67)
-      color: Color.popups.background
-      borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Math.max(1, Style.space(2)))
-      radius: Style.cornerRadius
-      opacity: root.reveal * (1 - root.finishProgress)
-      scale: 0.97 + root.reveal * 0.03 - root.finishProgress * 0.015
+    DictationPill {
+      session: dictation
+      meetingVisible: root.meetingVisible
+    }
 
-      Waveform {
-        anchors.centerIn: parent
-        width: implicitWidth
-        height: implicitHeight
-        barCount: root.barCount
-        barWidth: root.barWidth
-        barGap: root.barGap
-        minBarHeight: root.minBarHeight
-        maxBarHeight: root.maxBarHeight
-        baseLevel: root.baseLevel
-        phase: root.phase
-        processingMix: root.processingMix
-        finishProgress: root.finishProgress
-        levels: root.levels
-        displayState: root.displayState
-        waveColor: root.waveColor
-      }
+    MeetingPill {
+      presentation: meetingPresentation
     }
   }
 }

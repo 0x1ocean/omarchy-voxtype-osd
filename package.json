@@ -1,10 +1,12 @@
 {
   "name": "omarchy-voxtype-osd",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "A minimal, theme-aware Voxtype dictation OSD for Omarchy",
+  "description": "Live dictation feedback for Voxtype, styled by your Omarchy theme. Includes meeting status and a pause-aware timer.",
   "scripts": {
-    "test": "node --test tests/*.test.cjs"
+    "test": "node --test tests/*.test.cjs && python3 -m unittest discover -s tests -p '*_test.py'",
+    "test:qml": "python3 tests/run-qml.py",
+    "check": "npm test && npm run test:qml && omarchy plugin validate \"$PWD\""
   },
   "engines": {
     "node": ">=20"

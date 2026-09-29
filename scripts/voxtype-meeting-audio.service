@@ -1,0 +1,13 @@
+[Unit]
+Description=Record Voxtype meeting microphone and system audio
+After=voxtype.service pipewire-pulse.service
+Wants=voxtype.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/voxtype-meeting-audio
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

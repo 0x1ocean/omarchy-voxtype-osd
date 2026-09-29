@@ -1,0 +1,8 @@
+[Unit]
+Description=Save completed Voxtype meetings as Markdown notes
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/voxtype-meeting-export --notes-dir %h/notes/meetings
+UMask=0077
+TimeoutStartSec=5min

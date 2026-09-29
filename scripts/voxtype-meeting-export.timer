@@ -1,0 +1,10 @@
+[Unit]
+Description=Check for completed Voxtype meeting notes
+
+[Timer]
+OnStartupSec=10s
+OnUnitInactiveSec=10s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

@@ -1,19 +1,19 @@
 import QtQuick
 import qs.Commons
+import "../lib/DictationConfig.js" as DictationConfig
 import "../lib/WaveformMath.js" as WaveformMath
 
 Item {
   id: root
 
-  property int barCount: 29
-  property int barWidth: Style.space(3)
-  property int barGap: Style.space(4)
-  property int minBarHeight: Style.space(3)
-  property int maxBarHeight: Style.space(26)
+  property int barCount: DictationConfig.barCount
+  property int barWidth: Style.space(DictationConfig.barWidth)
+  property int barGap: Style.space(DictationConfig.barGap)
+  property int minBarHeight: Style.space(DictationConfig.minBarHeight)
+  property int maxBarHeight: Style.space(DictationConfig.maxBarHeight)
   property real baseLevel: 0.04
   property real phase: 0
   property real processingMix: 0
-  property real finishProgress: 0
   property var levels: []
   property string displayState: "idle"
   property color waveColor: Color.accent
@@ -23,14 +23,14 @@ Item {
 
   function levelAt(index) {
     var recorded = WaveformMath.recordingLevel(index, barCount, levels, baseLevel)
-    var processing = WaveformMath.processingLevel(index, barCount, phase)
-    return WaveformMath.mixedLevel(
-      recorded,
-      processing,
-      processingMix,
-      displayState === "finishing" ? finishProgress : 0,
-      baseLevel
-    )
+    var processing = WaveformMath.processingLevel(index, barCount, phase, baseLevel)
+    return WaveformMath.mixLevel(recorded, processing, processingMix)
+  }
+
+  function opacityAt(index) {
+    var mix = Math.max(0, Math.min(1, processingMix))
+    var processing = WaveformMath.processingOpacity(index, barCount, phase)
+    return 1 + (processing - 1) * mix
   }
 
   function heightAt(index) {
@@ -52,16 +52,14 @@ Item {
         anchors.verticalCenter: parent.verticalCenter
         radius: Style.cornerRadius > 0 ? width / 2 : 0
         color: root.waveColor
+        opacity: root.opacityAt(index)
 
         Behavior on height {
+          enabled: root.displayState === "recording"
           NumberAnimation {
-            duration: root.displayState === "recording" ? 45 : 75
+            duration: DictationConfig.barEaseMs
             easing.type: Easing.OutCubic
           }
-        }
-
-        Behavior on color {
-          ColorAnimation { duration: 160 }
         }
       }
     }

@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "io.github.0x1ocean.voxtype-osd",
   "name": "VoxWave",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "0x1ocean",
-  "description": "A minimal, theme-aware Voxtype dictation OSD for Omarchy.",
+  "description": "Live dictation feedback for Voxtype, styled by your Omarchy theme. Includes meeting status and a pause-aware timer.",
   "kinds": [
     "panel"
   ],
