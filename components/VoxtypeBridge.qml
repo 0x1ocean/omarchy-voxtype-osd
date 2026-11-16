@@ -33,7 +33,7 @@ Item {
   }
 
   RestartingStream {
-    command: ["omarchy-voxtype-status"]
+    command: ["voxtype", "status", "--follow", "--format", "json"]
     onLineReceived: function(data) { root.updateStatus(data) }
     onDisconnected: root.stateReceived("idle")
   }

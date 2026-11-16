@@ -19,6 +19,24 @@ transcribes, then the indicator fades as your text is inserted. VoxWave stays
 out of the way: it never takes focus or blocks clicks, and runs inside the
 existing Omarchy Shell.
 
+### Window glow
+
+By default VoxWave lights up the frame of the window you are dictating into
+instead of showing the pill. Light rises from both bottom corners, runs along
+the bottom edge as a soft wave that follows your voice, and keeps the bottom
+centre clear so the input line is never covered:
+
+- **Listening, silent** — a thin, calm glow tucked into the corners.
+- **Speaking** — the waves rise, speed up and reach inwards with your voice.
+- **Transcribing** — the waves settle, the hue shifts, and a light runs back
+  and forth along the bottom edge.
+- **Done** — a short flash along the whole bottom edge; a cancelled recording
+  simply fades out.
+
+The glow uses your theme's accent colour and follows focus between windows and
+monitors. To choose the indicator, set `indicator` in `lib/DictationConfig.js`
+to `"glow"` (default), `"pill"` or `"both"`.
+
 ### Meeting support
 
 During a Voxtype meeting, a static accent marker sits beside the status and

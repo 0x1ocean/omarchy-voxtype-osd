@@ -2,6 +2,16 @@
 
 All notable changes to VoxWave are documented here.
 
+## 0.4.0 — 2026-11-16
+
+- Add the window glow indicator, now the default: the focused window's frame
+  lights up from the bottom corners with a voice-driven wave, a transcribing
+  runner, and a completion flash. Choose `glow`, `pill` or `both` with
+  `indicator` in `lib/DictationConfig.js`.
+- Follow focus through Quickshell's Hyprland IPC instead of spawning hyprctl,
+  and render the blurred glow from a half-resolution bottom strip.
+- Read daemon state from `voxtype status --follow`.
+
 ## 0.3.0 — 2026-09-29
 
 - Refresh the release description and add a close-up screenshot of the real
