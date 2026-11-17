@@ -2,11 +2,14 @@ import QtQuick
 import Quickshell
 import Quickshell.Wayland
 import "components"
+import "lib/DictationConfig.js" as DictationConfig
 
 Item {
   id: root
 
   readonly property bool meetingVisible: meeting.active || meetingPresentation.presented
+  readonly property bool showPill: DictationConfig.indicator !== "glow"
+  readonly property bool showGlow: DictationConfig.indicator !== "pill"
   readonly property string runtimeDir: (Quickshell.env("XDG_RUNTIME_DIR")
     || "/run/user/" + Quickshell.env("UID")) + "/voxtype"
 
@@ -44,8 +47,13 @@ Item {
     }
   }
 
+  WindowGlow {
+    session: dictation
+    enabled: root.showGlow
+  }
+
   PanelWindow {
-    visible: dictation.panelMapped || root.meetingVisible
+    visible: (root.showPill && dictation.panelMapped) || root.meetingVisible
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
 
@@ -58,6 +66,7 @@ Item {
     mask: Region {}
 
     DictationPill {
+      visible: root.showPill && dictation.panelMapped
       session: dictation
       meetingVisible: root.meetingVisible
     }
